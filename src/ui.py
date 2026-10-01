@@ -1,7 +1,16 @@
-import streamlit as st
-import httpx
-from pathlib import Path
 import base64
+import os
+from pathlib import Path
+
+import httpx
+import streamlit as st
+
+from src import config  # noqa: F401 - loads .env before the constants below
+from src.auth import AuthError, principal_from_headers
+
+# The backend listens on container loopback only; it is never exposed publicly.
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
+REQUEST_TIMEOUT = float(os.getenv("UI_REQUEST_TIMEOUT", "180"))
 
 st.set_page_config(
     page_title="NEXA | Resume Builder",
@@ -10,13 +19,15 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+
 # Helper to encode local image for clean inline HTML rendering
 def get_image_base64(path_str: str) -> str:
-    path = Path(path_str)
+    path = Path(__file__).resolve().parent.parent / path_str
     if path.exists():
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
     return ""
+
 
 nexa_b64 = get_image_base64("src/assets/nexa_logo.png")
 
@@ -79,6 +90,15 @@ st.markdown("""
         color: #FFFFFF;
         font-size: 0.9rem;
         font-weight: 500;
+    }
+    .dev-pill {
+        background: rgba(255, 193, 7, 0.95);
+        color: #3A2A00;
+        padding: 6px 14px;
+        border-radius: 20px;
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.3px;
     }
 
     /* 3. Three Pop-Out Panes: Style native Streamlit bordered containers */
@@ -143,20 +163,82 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Auth Principal
-headers = getattr(st, "context", {}).headers if hasattr(st, "context") else {}
-user_email = headers.get("X-Ms-Client-Principal-Name", "ravi.shankar@insight.com")
+
+# =========================================================================
+# AUTHENTICATION GATE (Microsoft Entra ID via Azure App Service Easy Auth)
+#
+# Easy Auth validates the token at the platform edge and injects the verified
+# principal as request headers. If no principal is present the user is not
+# signed in, and the application renders nothing but a sign-in prompt.
+# =========================================================================
+def _request_headers() -> dict:
+    try:
+        return dict(st.context.headers)
+    except Exception:  # noqa: BLE001 - older Streamlit, or no active request
+        return {}
+
+
+def _render_sign_in_screen(message: str) -> None:
+    st.markdown(f"""
+    <div class="nexa-topbar">
+        <div class="brand-container">
+            <div style="background:#FFF; padding:10px; border-radius:4px; display:inline-block;">
+                <span style="color:#000; font-weight:600; font-size:1.4rem;">NEXA
+                <small style="color:#E6007E;">BUILDER</small></span>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.error(message)
+    st.markdown(
+        '<a href="/.auth/login/aad?post_login_redirect_uri=/" '
+        'style="display:inline-block; background:linear-gradient(90deg,#E6007E,#5C2483); '
+        'color:#FFF; padding:12px 28px; border-radius:8px; text-decoration:none; '
+        'font-weight:600;">Sign in with Microsoft</a>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Access is restricted to Insight corporate accounts. For local development, "
+        "set ALLOW_ANONYMOUS_AUTH=true in your .env file."
+    )
+
+
+incoming_headers = _request_headers()
+try:
+    principal = principal_from_headers(incoming_headers)
+except AuthError as exc:
+    _render_sign_in_screen(str(exc))
+    st.stop()
+
+
+def backend_headers() -> dict:
+    """Forward the verified principal to the backend.
+
+    The backend trusts these headers because it binds to container loopback and
+    is unreachable from outside; see the deployment note in the README.
+    """
+    forwarded = {
+        k: v for k, v in incoming_headers.items()
+        if k.lower().startswith("x-ms-client-principal")
+    }
+    if not forwarded and principal.is_dev_identity:
+        forwarded["X-Ms-Client-Principal-Name"] = principal.email
+    return forwarded
+
 
 # Top Header Bar
 logo_html = (
     f'<div style="background-color: #FFFFFF; padding: 10px; display: inline-block; border-radius: 4px;">'
     f'<img src="data:image/png;base64,{nexa_b64}" class="brand-logo-img" />'
     f'</div>'
-    if nexa_b64 else 
+    if nexa_b64 else
     '<div style="background-color: #FFFFFF; padding: 10px; display: inline-block; border-radius: 4px;">'
     '<span style="color:#000000; font-weight:600; font-size:1.4rem;">NEXA <small style="color:#E6007E;">BUILDER</small></span>'
     '</div>'
 )
+
+dev_badge = '<div class="dev-pill">DEV IDENTITY</div>' if principal.is_dev_identity else ""
 
 st.markdown(f"""
 <div class="nexa-topbar">
@@ -164,15 +246,16 @@ st.markdown(f"""
         {logo_html}
     </div>
     <div class="user-actions">
+        {dev_badge}
         <a href="#help" class="help-link">❓ Help</a>
-        <div class="user-pill">👤 {user_email}</div>
+        <div class="user-pill">👤 {principal.email}</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
 # State Management
 if "active_nav" not in st.session_state:
-    st.session_state.active_nav = "Create your Resume"
+    st.session_state.active_nav = "Upgrade your resume"
 if "manual_section" not in st.session_state:
     st.session_state.manual_section = "Personal Info"
 if "standardized_bytes" not in st.session_state:
@@ -184,16 +267,16 @@ if "resume_filename" not in st.session_state:
 left_col, center_col, right_col = st.columns([1.1, 2.2, 1.2], gap="medium")
 
 # =========================================================================
-# PANE 1: Navigation & Fill Section (Updated Sections List)
+# PANE 1: Navigation & Fill Section
 # =========================================================================
 with left_col:
     with st.container(border=True):
-        if st.button("⚡ Upgrade your resume", use_container_width=True, 
+        if st.button("⚡ Upgrade your resume", use_container_width=True,
                      type="primary" if st.session_state.active_nav == "Upgrade your resume" else "secondary"):
             st.session_state.active_nav = "Upgrade your resume"
             st.rerun()
 
-        if st.button("📝 Create your Resume", use_container_width=True, 
+        if st.button("📝 Create your Resume", use_container_width=True,
                      type="primary" if st.session_state.active_nav == "Create your Resume" else "secondary"):
             st.session_state.active_nav = "Create your Resume"
             st.rerun()
@@ -227,16 +310,13 @@ with left_col:
                         st.rerun()
 
                 if i + 1 < len(sections):
-                    icon2, label2 = sections[i+1]
+                    icon2, label2 = sections[i + 1]
                     with c2:
                         is_active2 = (st.session_state.manual_section == label2)
                         if st.button(f"{icon2}\n{label2}", key=f"btn_{label2}", use_container_width=True,
                                      type="primary" if is_active2 else "secondary"):
                             st.session_state.manual_section = label2
                             st.rerun()
-
-            st.write("")
-            st.button("➕ New Section", use_container_width=True, type="secondary")
 
 # =========================================================================
 # PANE 2: Upload Resume OR Form Workspace
@@ -246,33 +326,60 @@ with center_col:
         if st.session_state.active_nav == "Upgrade your resume":
             st.markdown("""
                 <h3 style="margin-top:0; color:#1F2937; font-weight:700;">Upgrade Your Existing Resume</h3>
-                <p style="color:#6B7280; font-size:0.92rem; margin-bottom:20px;">Upload an existing document (.doc, .docx, .pdf) to synthesize, re-index, and align it to corporate branding.</p>
+                <p style="color:#6B7280; font-size:0.92rem; margin-bottom:20px;">Upload an existing document to synthesize, re-index, and align it to corporate branding.</p>
             """, unsafe_allow_html=True)
 
             uploaded_file = st.file_uploader(
                 "Upload Document",
-                type=["doc", "docx", "pdf"],
+                type=["docx", "pdf"],
                 label_visibility="collapsed"
+            )
+            st.caption(
+                "Accepts .docx and text-based .pdf. Legacy .doc files must be re-saved as "
+                ".docx in Word first. Scanned/image-only PDFs cannot be read."
             )
 
             st.write("")
             upgrade_btn = st.button("⚡ Upgrade Resume", type="primary", disabled=uploaded_file is None)
 
             if upgrade_btn and uploaded_file is not None:
-                with st.spinner("Extracting entities and aligning corporate templates..."):
+                # The HuggingFace free tier regularly takes 60-120s for a full
+                # resume, so the wait is set out explicitly rather than left to
+                # a bare spinner that looks indistinguishable from a hang.
+                with st.spinner(
+                    "Extracting entities and aligning corporate templates... "
+                    "This usually takes 1-2 minutes on the free AI tier."
+                ):
                     try:
                         files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
-                        response = httpx.post("http://127.0.0.1:8000/standardize-resume", files=files, timeout=120.0)
+                        response = httpx.post(
+                            f"{BACKEND_URL}/standardize-resume",
+                            files=files,
+                            headers=backend_headers(),
+                            timeout=REQUEST_TIMEOUT,
+                        )
 
                         if response.status_code == 200:
                             st.session_state.standardized_bytes = response.content
                             st.session_state.resume_filename = f"Standardized_{Path(uploaded_file.name).stem}.docx"
-                            st.success("Resume standardization complete.")
                             st.rerun()
                         else:
-                            st.error(f"Processing error: {response.text}")
-                    except Exception as e:
-                        st.error(f"Backend communication error: {str(e)}")
+                            # The backend returns actionable messages in `detail`.
+                            try:
+                                detail = response.json().get("detail", response.text)
+                            except Exception:  # noqa: BLE001
+                                detail = response.text
+                            st.error(f"Could not process this resume: {detail}")
+                    except httpx.TimeoutException:
+                        st.error(
+                            "The extraction service timed out. Very long resumes can exceed the "
+                            "time limit -- please retry."
+                        )
+                    except httpx.RequestError as exc:
+                        st.error(
+                            f"Cannot reach the backend at {BACKEND_URL}. Make sure the FastAPI "
+                            f"service is running. ({exc})"
+                        )
 
         elif st.session_state.active_nav == "Create your Resume":
             st.markdown(f"""
@@ -285,49 +392,60 @@ with center_col:
                 </div>
             """, unsafe_allow_html=True)
 
+            st.warning(
+                "**Preview only.** This section is not wired to the document engine yet -- "
+                "entries are not saved and cannot be compiled. Date pickers for each company "
+                "and project, plus skill and certification pickers, are the next milestone. "
+                "Use **Upgrade your resume** for a working end-to-end document today.",
+                icon="🚧",
+            )
+
             if st.session_state.manual_section == "Personal Info":
-                st.text_input("Full Name", placeholder="e.g. Jhon Doe")
+                st.text_input("Full Name", placeholder="e.g. Jane Doe", key="pi_name")
                 col_r, col_l = st.columns(2)
                 with col_r:
-                    st.text_input("Target Designation", placeholder="e.g. Architect - Data & AI")
+                    st.text_input("Target Designation", placeholder="e.g. Architect - Data & AI", key="pi_title")
                 with col_l:
-                    st.text_input("Location / City", placeholder="e.g. Gurugram, India")
+                    st.text_input("Location / City", placeholder="e.g. Gurugram, India", key="pi_location")
 
             elif st.session_state.manual_section == "Exec Summary":
-                st.text_area("Executive Summary", placeholder="Enter structured executive profile overview...", height=200)
+                st.text_area("Executive Summary", placeholder="Enter structured executive profile overview...",
+                             height=200, key="es_summary")
 
             elif st.session_state.manual_section == "Work Experience":
-                st.text_input("Company / Organization", placeholder="e.g. Insight Direct India Pvt. Ltd.")
+                st.text_input("Company / Organization", placeholder="e.g. Insight Direct India Pvt. Ltd.", key="we_company")
                 col_t, col_d = st.columns(2)
                 with col_t:
-                    st.text_input("Role Title", placeholder="e.g. Lead Architect")
+                    st.text_input("Role Title", placeholder="e.g. Lead Architect", key="we_role")
                 with col_d:
-                    st.text_input("Duration", placeholder="e.g. Apr 2012 - Present")
-                st.text_area("Key Responsibilities & Deliverables", placeholder="• Bullet 1\n• Bullet 2", height=150)
+                    st.text_input("Duration", placeholder="e.g. Apr 2012 - Present", key="we_duration")
+                st.text_area("Key Responsibilities & Deliverables", placeholder="• Bullet 1\n• Bullet 2",
+                             height=150, key="we_bullets")
 
             elif st.session_state.manual_section == "Education":
-                st.text_input("Institution Name", placeholder="e.g. Delhi University")
+                st.text_input("Institution Name", placeholder="e.g. Delhi University", key="ed_institution")
                 col_deg, col_yr = st.columns(2)
                 with col_deg:
-                    st.text_input("Degree / Major", placeholder="e.g. B.Tech Computer Science")
+                    st.text_input("Degree / Major", placeholder="e.g. B.Tech Computer Science", key="ed_degree")
                 with col_yr:
-                    st.text_input("Year of Completion", placeholder="e.g. 2012")
+                    st.text_input("Year of Completion", placeholder="e.g. 2012", key="ed_year")
 
             elif st.session_state.manual_section == "Areas of Expertise":
-                st.text_area("Technical & Functional Domains", placeholder="e.g. Solution Architecture, Enterprise Data Warehousing, GenAI Integrations (comma-separated or one per line)", height=150)
+                st.text_area("Technical & Functional Domains",
+                             placeholder="e.g. Solution Architecture, Enterprise Data Warehousing, GenAI Integrations",
+                             height=150, key="ax_areas")
 
             elif st.session_state.manual_section == "Certifications":
-                st.text_area("Official Credentials", placeholder="• Microsoft Certified: Azure Solutions Architect Expert\n• Databricks Certified Data Engineer Professional", height=150)
-
-            else:
-                st.text_area(f"{st.session_state.manual_section} Items", placeholder=f"Provide detailed bullet items for {st.session_state.manual_section}...", height=180)
+                st.text_area("Official Credentials",
+                             placeholder="• Microsoft Certified: Azure Solutions Architect Expert",
+                             height=150, key="ce_certs")
 
             st.write("")
             btn_c1, btn_c2 = st.columns([1, 1])
             with btn_c1:
-                st.button("Save Section", type="primary", use_container_width=True)
+                st.button("Save Section", type="primary", use_container_width=True, disabled=True)
             with btn_c2:
-                st.button("Reset Form", type="secondary", use_container_width=True)
+                st.button("Reset Form", type="secondary", use_container_width=True, disabled=True)
 
 # =========================================================================
 # PANE 3: Preview & Download
@@ -340,9 +458,9 @@ with right_col:
         """, unsafe_allow_html=True)
 
         if st.session_state.standardized_bytes:
-            st.success("Artifact Ready!")
+            st.success("Resume standardization complete.")
             st.markdown(f"**File:** `{st.session_state.resume_filename}`")
-            
+
             st.download_button(
                 label="📥 Download Resume (.docx)",
                 data=st.session_state.standardized_bytes,
@@ -351,11 +469,12 @@ with right_col:
                 type="primary",
                 use_container_width=True
             )
+            if st.button("Start over", type="secondary", use_container_width=True):
+                st.session_state.standardized_bytes = None
+                st.session_state.resume_filename = ""
+                st.rerun()
         else:
-            st.info("No document compiled yet. Upload or save sections to activate download.")
-            st.button("👁️ Preview Resume", use_container_width=True, type="secondary")
-            st.write("")
-            st.button("🚀 Compile Document", type="primary", use_container_width=True)
+            st.info("No document compiled yet. Upload a resume to activate download.")
 
         st.markdown("""
             <div class="ai-disclaimer">
