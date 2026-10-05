@@ -169,6 +169,16 @@ st.markdown("""
         line-height: 1.5;
         margin-top: auto;
     }
+    /* 7. Bottom Footer Branding */
+    .nexa-footer {
+        text-align: center;
+        color: #6B7280;
+        font-size: 0.80rem;
+        font-weight: 500;
+        letter-spacing: 0.2px;
+        padding-top: 10px;
+        margin-top: 6px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -610,3 +620,12 @@ with right_col:
                 Content is extracted and structured using generative AI. Verify dates, credentials, and achievements for fidelity prior to client distribution.
             </div>
         """, unsafe_allow_html=True)
+
+# =========================================================================
+# PAGE FOOTER
+# =========================================================================
+st.markdown("""
+<div class="nexa-footer">
+    &copy; NExt generation eXperience &amp; Automation (NEXA)
+</div>
+""", unsafe_allow_html=True)
