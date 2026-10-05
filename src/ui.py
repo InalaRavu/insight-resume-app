@@ -69,6 +69,15 @@ st.markdown("""
         mix-blend-mode: multiply;
         display: block;
     }
+    .banner-center-title {
+        text-align: center;
+        color: #FFFFFF;
+        font-size: 1.05rem;
+        font-weight: 600;
+        letter-spacing: 0.6px;
+        white-space: nowrap;
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    }
     .user-actions {
         display: flex;
         align-items: center;
@@ -253,6 +262,9 @@ st.markdown(f"""
 <div class="nexa-topbar">
     <div class="brand-container">
         {logo_html}
+    </div>
+    <div class="banner-center-title">
+        NExt generation eXperience &amp; Automation (NEXA)
     </div>
     <div class="user-actions">
         {dev_badge}
