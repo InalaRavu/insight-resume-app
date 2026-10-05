@@ -1,0 +1,15 @@
+services:
+  nexa-resume-app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: nexa_resume_container
+    ports:
+      # Only the Streamlit UI is published. Port 8000 is deliberately NOT mapped:
+      # the backend trusts forwarded Easy Auth headers and must stay private.
+      - "8501:8501"
+    env_file:
+      - ../.env
+    environment:
+      - WEBSITES_PORT=8501
+    restart: always

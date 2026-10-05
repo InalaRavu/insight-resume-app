@@ -2,10 +2,11 @@
 .env
 *.env
 
-# Temporary and legacy test scripts containing keys
-test_*.py
-app_*.py
-app working.py
+# Temporary and legacy scratch scripts that held keys. Anchored to the repo root
+# so the real suite under tests/ is tracked.
+/test_*.py
+/app_*.py
+/app working.py
 *.tmp
 
 # Standard Python exclusions
