@@ -108,7 +108,9 @@ class WorkHistory(BaseModel):
 
 class EducationItem(BaseModel):
     degree: str
-    institution: str
+    # Optional so the model is not pushed into inventing one: a required field
+    # came back as "Institution Name Not Provided" for a CV that names none.
+    institution: str = Field(default="", description="School or university name; empty if the source names none")
     score: Optional[str] = None
 
 
@@ -126,6 +128,98 @@ class ResumeData(BaseModel):
     work_experience: List[WorkHistory] = Field(default_factory=list)
 
 
+# Two-column PDF detection. A sidebar CV read line by line interleaves the two
+# columns ("Databricks, Azure Data Factory, Designation: Automation Solution
+# Architect"), and the model then pairs roles and dates with the wrong employer.
+MIN_GUTTER_PT = 6             # narrowest empty band accepted as a column gutter
+GUTTER_SEARCH = (0.15, 0.85)  # gutters are looked for in this share of the width
+MIN_COLUMN_SHARE = 0.15       # each column must hold at least this share of the words
+MIN_SHARED_ROWS = 5           # rows with text on both sides, i.e. truly side by side
+
+
+def _page_text(page) -> str:
+    return page.extract_text(layout=True) or page.extract_text() or ""
+
+
+def _column_split(page) -> Optional[float]:
+    """x position of the gutter on a two-column page, or None for one column."""
+    words = page.extract_words()
+    if len(words) < 20:
+        return None
+
+    width = int(page.width) + 1
+    occupied = [False] * width
+    for w in words:
+        for x in range(max(0, int(w["x0"])), min(width, int(w["x1"]) + 1)):
+            occupied[x] = True
+
+    # A gutter has text on both sides. The empty margin beside a short column
+    # is never closed by text, so it cannot be mistaken for one.
+    lo, hi = width * GUTTER_SEARCH[0], width * GUTTER_SEARCH[1]
+    best, start = None, None
+    for x in range(width):
+        if not occupied[x]:
+            if start is None and x > 0:
+                start = x
+            continue
+        if start is not None:
+            if (x - start >= MIN_GUTTER_PT and lo <= (start + x) / 2 <= hi
+                    and (best is None or x - start > best[1] - best[0])):
+                best = (start, x)
+            start = None
+    if best is None:
+        return None
+
+    split = (best[0] + best[1]) / 2
+    left = [w for w in words if w["x1"] <= split]
+    right = [w for w in words if w["x0"] >= split]
+    if min(len(left), len(right)) < MIN_COLUMN_SHARE * len(words):
+        return None
+    # Baselines rarely match across columns set in different font sizes, so a
+    # row counts as shared when a left word overlaps a right word vertically.
+    shared_rows = {
+        round(lw["top"]) for lw in left
+        if any(rw["top"] < lw["bottom"] and lw["top"] < rw["bottom"] for rw in right)
+    }
+    if len(shared_rows) < MIN_SHARED_ROWS:
+        return None
+    return split
+
+
+def _pdf_text_by_column(pages) -> List[str]:
+    """Page text, with two-column pages read one column at a time.
+
+    A sidebar runs on from page to page, so consecutive two-column pages are
+    emitted as the whole left column followed by the whole right column. Reading
+    page by page would drop the page-2 sidebar into the middle of an employer
+    whose roles continue from page 1 onto page 2.
+    """
+    out, left_run, right_run = [], [], []
+
+    def _flush():
+        out.extend(left_run + right_run)
+        left_run.clear()
+        right_run.clear()
+
+    for page in pages:
+        split = _column_split(page)
+        if split is None:
+            _flush()
+            text = _page_text(page)
+            if text:
+                out.append(text)
+            continue
+        for run, bbox in (
+            (left_run, (0, 0, split, page.height)),
+            (right_run, (split, 0, page.width, page.height)),
+        ):
+            text = _page_text(page.crop(bbox))
+            if text.strip():
+                run.append(text)
+    _flush()
+    return out
+
+
 # 4. Text Extractor (File Bytes -> Clean Text)
 def extract_raw_text(file_bytes: bytes, filename: str) -> str:
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -133,12 +227,7 @@ def extract_raw_text(file_bytes: bytes, filename: str) -> str:
 
     if ext == "pdf":
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text(layout=True)
-                if not text:
-                    text = page.extract_text()
-                if text:
-                    extracted_text.append(text)
+            extracted_text.extend(_pdf_text_by_column(pdf.pages))
 
     elif ext == "docx":
         try:
@@ -221,6 +310,24 @@ def extract_raw_text(file_bytes: bytes, filename: str) -> str:
 
 
 # 5. Context Sanitization
+
+# Filler the model writes instead of leaving a field empty, e.g. "Institution
+# Name Not Provided" or "N/A". Matched against the whole value only, so a real
+# sentence that merely contains "not provided" is untouched.
+_PLACEHOLDER = re.compile(
+    r'^[\s(\[]*(?:(?:the\s+)?(?:institution|university|college|school|company|employer|'
+    r'organi[sz]ation|degree|score|grade|cgpa|gpa|date|dates|duration|location|title|role)'
+    r'(?:\s+(?:name|details|info|information))?\s*(?:is\s+)?[:\-]?\s*)?'
+    r'(?:not\s+(?:provided|specified|available|mentioned|listed|given|stated|found)|'
+    r'n\s*/\s*a|na|none|nil|null|unknown|unspecified|tbd|-+)[\s.)\]]*$',
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder(val) -> bool:
+    return isinstance(val, str) and bool(_PLACEHOLDER.match(val))
+
+
 def sanitize_resume_dict(data: dict) -> dict:
     def _clean_str(val: str) -> str:
         if not isinstance(val, str):
@@ -237,9 +344,9 @@ def sanitize_resume_dict(data: dict) -> dict:
 
     def _walk(val):
         if isinstance(val, str):
-            return _clean_str(val)
+            return "" if _is_placeholder(val) else _clean_str(val)
         elif isinstance(val, list):
-            return [_walk(x) for x in val]
+            return [_walk(x) for x in val if not _is_placeholder(x)]
         elif isinstance(val, dict):
             return {k: _walk(v) for k, v in val.items()}
         return val
@@ -682,7 +789,11 @@ Strict Extraction & Formatting Rules:
      reusing another employer's bullets is a serious error.
 8. education: list EVERY qualification found, highest first. Include degrees even when the
    source lists them only in a table, sidebar or abbreviated form (B.Tech, B.Sc, MCA, MBA).
+   institution and score: only as written in the source. If the source names no
+   institution, institution is "" -- e.g. "Education: B.Tech (Computer Science)" gives
+   degree "B.Tech (Computer Science)" and institution "".
 9. Never invent facts. If a field is absent from the source, return an empty string or empty list.
+   Never write a placeholder such as "Not Provided", "N/A" or "Unknown" in any field.
 
 Return pure JSON only, with no prose and no markdown fences.
 """

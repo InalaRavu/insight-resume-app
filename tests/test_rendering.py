@@ -19,10 +19,12 @@ from docx import Document  # noqa: E402
 
 from src.app import (  # noqa: E402
     TEMPLATE_VARIABLES,
+    EducationItem,
     _compose_institution_line,
     _extract_json_object,
     build_render_context,
     render_resume,
+    sanitize_resume_dict,
     template_contract_report,
 )
 
@@ -130,3 +132,56 @@ def test_extract_json_object_strips_fences_and_prose():
 
 def test_extract_json_object_ignores_braces_inside_strings():
     assert _extract_json_object('{"a": "a } brace"}') == '{"a": "a } brace"}'
+
+
+# ------------------------------------------------ education without a school
+def _education_block(payload: dict) -> list:
+    """Paragraphs from the degree up to the next section heading."""
+    doc = Document(io.BytesIO(render_resume(build_render_context(payload))))
+    paras = [p.text.strip() for t in doc.tables for r in t.rows for c in r.cells for p in c.paragraphs]
+    start = paras.index("B.Tech (Computer Science)")
+    return paras[start:paras.index("CERTIFICATIONS", start)]
+
+
+def test_degree_without_institution_renders_alone():
+    """Regression: the institution line rendered 'Institution Name Not Provided'."""
+    payload = sanitize_resume_dict(dict(SAMPLE, education=[
+        {"degree": "B.Tech (Computer Science)", "institution": "Institution Name Not Provided", "score": None}
+    ]))
+    # Degree, then only the template's own spacer before CERTIFICATIONS: no
+    # placeholder text and no blank line where the institution would have been.
+    assert _education_block(payload) == ["B.Tech (Computer Science)", ""]
+
+
+def test_institution_still_renders_when_present():
+    payload = dict(SAMPLE, education=[
+        {"degree": "B.Tech (Computer Science)", "institution": "JNTU Hyderabad", "score": ""}
+    ])
+    assert _education_block(payload) == ["B.Tech (Computer Science)", "JNTU Hyderabad", ""]
+
+
+@pytest.mark.parametrize("placeholder", [
+    "Institution Name Not Provided", "Not Provided", "N/A", "n/a", "Unknown",
+    "Institution: Not specified", "(not mentioned)", "-", "None",
+])
+def test_placeholders_are_blanked(placeholder):
+    cleaned = sanitize_resume_dict({"education": [{"degree": "MBA", "institution": placeholder}]})
+    assert cleaned["education"][0]["institution"] == ""
+
+
+@pytest.mark.parametrize("real", [
+    "Institute of Unknown Studies", "Not Provided by HR: escalated access requests",
+    "National Academy", "Nanyang Technological University",
+])
+def test_real_values_are_not_mistaken_for_placeholders(real):
+    cleaned = sanitize_resume_dict({"education": [{"degree": "MBA", "institution": real}]})
+    assert cleaned["education"][0]["institution"] == real
+
+
+def test_placeholder_list_items_are_dropped():
+    cleaned = sanitize_resume_dict({"certifications": ["AZ-305", "N/A"]})
+    assert cleaned["certifications"] == ["AZ-305"]
+
+
+def test_schema_does_not_force_an_institution():
+    assert EducationItem(degree="B.Tech").institution == ""
